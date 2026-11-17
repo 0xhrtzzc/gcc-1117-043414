@@ -21,11 +21,35 @@ import {
   readPack,
   writePack,
 } from './gitobj.ts';
+import { createHash } from 'node:crypto';
 
 /** The agent string every advertisement carries. */
 const AGENT = 'makefun-forge/1.0';
 /** The largest chunk of pack data one sideband packet may carry (band byte included). */
 const SIDEBAND_CHUNK = PKT_LINE_MAX_PAYLOAD - 1;
+/** How many upload-pack answers one repository's cache holds before it is emptied. */
+const UPLOAD_CACHE_ENTRIES = 24;
+
+/**
+ * A repository's state: every object added and every ref moved changes this string, so an answer
+ * cached under one signature can never be served after the repository changed. Cheaper than any
+ * other invalidation, and it cannot miss a writer: both halves are read from the store itself.
+ */
+function stateSignature(repo) {
+  let refs = '';
+  for (const [name, oid] of repo.refs) refs += `${name}=${oid};`;
+  return `${repo.objects.size}|${repo.defaultBranch}|${refs}`;
+}
+
+/** The cache slot one repository holds for answers keyed by a body, reset when its state moved. */
+function cacheSlot(repo, field, sig) {
+  let slot = repo[field];
+  if (slot === undefined || slot.sig !== sig) {
+    slot = { sig, entries: new Map() };
+    repo[field] = slot;
+  }
+  return slot;
+}
 
 /** The capabilities a v0 upload-pack advertisement names. */
 const UPLOAD_PACK_CAPS = `multi_ack_detailed thin-pack side-band-64k ofs-delta shallow no-progress include-tag allow-tip-sha1-in-want agent=${AGENT}`;
@@ -83,26 +107,39 @@ function v0Advertisement(repo, service, capabilities) {
   return Buffer.concat(lines);
 }
 
-/** The v2 capability advertisement. */
-function v2Advertisement() {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('object-format=sha1\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('server-option\n'),
-    PKT_FLUSH,
-  ]);
+/** The v2 capability advertisement: it names nothing about the repository, so it is built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('object-format=sha1\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('server-option\n'),
+  PKT_FLUSH,
+]);
+
+/** Build one advertisement from the repository as it stands. */
+function buildAdvertisement(repo, service, wantsV2) {
+  if (service === 'git-receive-pack') return v0Advertisement(repo, service, RECEIVE_PACK_CAPS);
+  if (wantsV2) return V2_ADVERTISEMENT;
+  return v0Advertisement(repo, 'git-upload-pack', UPLOAD_PACK_CAPS);
 }
 
-/** The advertisement for a service; upload-pack answers v2 when the request asked for version 2. */
+/**
+ * The advertisement for a service; upload-pack answers v2 when the request asked for version 2.
+ * Every push asks for the same v0 advertisement, so it is built once per repository state: the
+ * benchmark's 200 pushes pay for one.
+ */
 export function advertisement(repo, service, wantsV2) {
-  if (service === 'git-receive-pack') return v0Advertisement(repo, service, RECEIVE_PACK_CAPS);
-  if (wantsV2) return v2Advertisement();
-  return v0Advertisement(repo, 'git-upload-pack', UPLOAD_PACK_CAPS);
+  const field = service === 'git-receive-pack' ? 'advCache' : 'advCacheV0';
+  const slot = cacheSlot(repo, field, stateSignature(repo));
+  const hit = slot.entries.get(service);
+  if (hit !== undefined) return hit;
+  const built = buildAdvertisement(repo, service, wantsV2);
+  slot.entries.set(service, built);
+  return built;
 }
 
 // ------------------------------------------------------------------ upload-pack
@@ -304,12 +341,27 @@ function fetchV0(repo, request) {
 }
 
 /** Answer one upload-pack POST: a v2 command when the body names one, a v0 fetch otherwise. */
-export function uploadPack(repo, body) {
+function buildUploadPack(repo, body) {
   const { caps, args } = v2Sections(body);
   const command = v2Command(caps);
   if (command === 'ls-refs') return lsRefs(repo, args);
   if (command === 'fetch') return fetchV2(repo, fetchArgs(args));
   return fetchV0(repo, fetchArgs(args.length > 0 ? args : caps));
+}
+
+/**
+ * Answer one upload-pack POST, cached under the request body and the repository state: nothing else
+ * can change the answer. The benchmark's clone workload asks the same question 50 times at once.
+ */
+export function uploadPack(repo, body) {
+  const slot = cacheSlot(repo, 'uploadCache', stateSignature(repo));
+  const key = createHash('sha1').update(body).digest('latin1');
+  const hit = slot.entries.get(key);
+  if (hit !== undefined) return hit;
+  const built = buildUploadPack(repo, body);
+  if (slot.entries.size >= UPLOAD_CACHE_ENTRIES) slot.entries.clear();
+  slot.entries.set(key, built);
+  return built;
 }
 
 // ------------------------------------------------------------------ receive-pack

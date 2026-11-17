@@ -36,8 +36,13 @@ function sendJson(res, status, body, headers) {
   res.end(text);
 }
 
-/** Answer one router result: pre-serialized text when the route cached it, JSON otherwise. */
+/** Answer one router result: prebuilt bytes when the route holds them, serialized text, else JSON. */
 function sendAnswer(res, answer) {
+  if (answer.bytes !== undefined) {
+    res.writeHead(answer.status, answer.headers ?? { 'content-type': 'application/json; charset=utf-8' });
+    res.end(answer.bytes);
+    return;
+  }
   if (answer.text !== undefined) {
     res.writeHead(answer.status, {
       'content-type': 'application/json; charset=utf-8',

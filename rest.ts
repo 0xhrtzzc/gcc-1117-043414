@@ -176,14 +176,28 @@ export function issueJson(repo, issue) {
 
 /**
  * One issue's body as the exact response text. A single-issue read is the benchmark's hottest path,
- * so the serialized body is cached against the issue's version and only rebuilt once it changed.
+ * so the serialized body, its encoded bytes and the header object are all cached against the issue's
+ * version and only rebuilt once it changed: a read then hands the socket bytes it already holds.
  */
 export function issueJsonText(repo, issue) {
   const cached = issue.jsonCache;
   if (cached !== null && cached !== undefined && cached.version === issue.version) return cached.text;
   const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
-  issue.jsonCache = { version: issue.version, text };
+  const bytes = Buffer.from(text, 'utf8');
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': bytes.length,
+    'cache-control': 'no-store',
+  };
+  issue.jsonCache = { version: issue.version, text, bytes, headers };
   return text;
+}
+
+/** The one-issue GET answer: the cached body, its bytes and its headers, ready to write. */
+export function issueAnswer(repo, issue) {
+  issueJsonText(repo, issue);
+  const cache = issue.jsonCache;
+  return { status: 200, text: cache.text, bytes: cache.bytes, headers: cache.headers };
 }
 
 /** One issue comment as the API spells it. */
@@ -676,7 +690,8 @@ export class RestRouter {
         }
         const created = forge.createIssue(repo, { title: body.title, body: body.body, labels: body.labels });
         if (created.error !== undefined) return { status: 422, body: { message: created.error, errors: [{ resource: 'Issue', field: 'labels', code: 'invalid' }] } };
-        return { status: 201, body: issueJson(repo, created.issue) };
+        const text = issueJsonText(repo, created.issue);
+        return { status: 201, text, bytes: created.issue.jsonCache.bytes, headers: created.issue.jsonCache.headers };
       }
       return null;
     }
@@ -685,7 +700,7 @@ export class RestRouter {
     const issue = Number.isFinite(number) ? forge.findIssue(repo, number) : null;
     if (tail.length === 1) {
       if (issue === null) return { status: 404, body: { message: 'Not Found' } };
-      if (request.method === 'GET') return { status: 200, text: issueJsonText(repo, issue) };
+      if (request.method === 'GET') return issueAnswer(repo, issue);
       if (request.method === 'PATCH') {
         const body = request.body ?? {};
         if (typeof body.title === 'string') issue.title = body.title;
